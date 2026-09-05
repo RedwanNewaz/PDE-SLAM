@@ -15,6 +15,22 @@ import jax.numpy as jnp
 from jax import Array
 
 
+def _apply_neutral_correction(lw: Array, trusted: Array, n_trusted: Array) -> Array:
+    """Replace untrusted particles' log-weights with the mean of trusted ones."""
+    lw_masked = jnp.where(trusted, lw, -1e9)
+    c0 = jnp.max(lw_masked)
+    exp_diff = jnp.where(trusted, jnp.exp(lw - c0), 0.0)
+    mean_exp = jnp.sum(exp_diff) / jnp.maximum(n_trusted, 1)
+    neutral_val = c0 + jnp.log(mean_exp)
+    return jnp.where(trusted, lw, neutral_val)
+
+
+def _neutral_correction_fallback(lw: Array, trusted: Array, n_trusted: Array) -> Array:
+    """No-op branch used when there is nothing to correct against."""
+    del trusted
+    return jnp.where(n_trusted == 0, jnp.zeros_like(lw), lw)
+
+
 class RbpfState(NamedTuple):
     """Read-only snapshot of the RBPF SLAM state."""
 
@@ -64,6 +80,14 @@ class RbpfSlam:
         Threshold for map variance to trigger neutral correction.
     seed : int, default=0
         Seed for JAX PRNG key.
+    preallocate_steps : int or None, default=None
+        If set, preallocates the ``trajectories`` buffer to this many steps and
+        writes into it in place with a static shape on every ``predict()`` call,
+        instead of growing it via ``jnp.concatenate`` each step. This avoids a
+        fresh XLA (re)compile per step for every op touching ``trajectories``
+        (predict/resample), at the cost of ``get_best_estimate()`` needing a
+        dynamic-length slice internally. Leave ``None`` (default) to keep the
+        original growing-array behavior unchanged.
     """
 
     N: int
@@ -109,9 +133,12 @@ class RbpfSlam:
         enable_neutral_correction: bool = True,
         untrusted_var_thresh: float | None = None,
         seed: int = 0,
+        preallocate_steps: int | None = None,
     ) -> None:
         self.N = n_particles
         self.key = jax.random.PRNGKey(seed)
+        self._preallocate_steps = preallocate_steps
+        self._step_idx = 0
 
         if process_noise is not None:
             self.Q_nl = jnp.asarray(process_noise)
@@ -190,7 +217,13 @@ class RbpfSlam:
         self.P = jnp.tile(p0_matrix, (self.N, 1, 1))
 
         self.log_weights = jnp.full((self.N,), -jnp.log(self.N))
-        self.trajectories = self.poses[:, None, :]
+        self._step_idx = 0
+
+        if self._preallocate_steps is not None:
+            traj_buf = jnp.zeros((self.N, self._preallocate_steps + 1, 2))
+            self.trajectories = traj_buf.at[:, 0, :].set(self.poses)
+        else:
+            self.trajectories = self.poses[:, None, :]
 
     def predict(self, control: Array, dt: float) -> None:
         """Predict step using differential drive motion model.
@@ -219,9 +252,17 @@ class RbpfSlam:
         self.headings = self.headings + dth
         self.speeds = v_cmd
 
-        self.trajectories = jnp.concatenate(
-            [self.trajectories, self.poses[:, None, :]], axis=1
-        )
+        if self._preallocate_steps is not None:
+            self._step_idx += 1
+            # Static-shape in-place write (fixed buffer size every call) so this
+            # op compiles once instead of recompiling for a new shape each step.
+            self.trajectories = self.trajectories.at[:, self._step_idx, :].set(
+                self.poses
+            )
+        else:
+            self.trajectories = jnp.concatenate(
+                [self.trajectories, self.poses[:, None, :]], axis=1
+            )
 
         # Propagate linear covariance P += Q_lin
         n_fields = self.P.shape[1]
@@ -355,19 +396,18 @@ class RbpfSlam:
             n_trusted = jnp.sum(trusted)
             n_untrusted = jnp.sum(untrusted)
 
-            def _apply_neutral(lw: Array) -> Array:
-                lw_masked = jnp.where(trusted, lw, -1e9)
-                c0 = jnp.max(lw_masked)
-                exp_diff = jnp.where(trusted, jnp.exp(lw - c0), 0.0)
-                mean_exp = jnp.sum(exp_diff) / jnp.maximum(n_trusted, 1)
-                neutral_val = c0 + jnp.log(mean_exp)
-                return jnp.where(untrusted, neutral_val, lw)
-
+            # NOTE: these branch functions must be stable, module-level callables
+            # (see _apply_neutral_correction / _neutral_correction_fallback above).
+            # Defining them as closures here would give jax.lax.cond a fresh
+            # Python-function identity every call, guaranteeing a JIT cache miss
+            # (and a full XLA recompile) on every single update() invocation.
             log_w = jax.lax.cond(
                 (n_trusted > 0) & (n_untrusted > 0),
-                _apply_neutral,
-                lambda lw: jnp.where(n_trusted == 0, jnp.zeros_like(lw), lw),
+                _apply_neutral_correction,
+                _neutral_correction_fallback,
                 log_w,
+                trusted,
+                n_trusted,
             )
 
         unnorm_log_weights = self.log_weights + log_w
@@ -416,6 +456,7 @@ class RbpfSlam:
             2x2 covariance.
         """
         weights = jnp.exp(self.log_weights)
+        weights = jnp.nan_to_num(weights, nan=1.0 / self.N)
         weights = weights / jnp.sum(weights)
 
         mean_pose = jnp.sum(self.poses * weights[:, None], axis=0)
@@ -444,7 +485,13 @@ class RbpfSlam:
         weights = jnp.nan_to_num(weights, nan=1.0 / self.N)
         weights = weights / jnp.sum(weights)
         weights_3d = weights[:, None, None]
-        mean_trajectory = jnp.sum(self.trajectories * weights_3d, axis=0)
+
+        if self._preallocate_steps is not None:
+            valid_traj = self.trajectories[:, : self._step_idx + 1, :]
+        else:
+            valid_traj = self.trajectories
+
+        mean_trajectory = jnp.sum(valid_traj * weights_3d, axis=0)
         mean_pose = mean_trajectory[-1]
         return mean_trajectory, mean_pose
 

@@ -467,6 +467,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
         measurement_mode="pinn",
         pinn_map=pinn_map,
         seed=rbpf_seed,
+        preallocate_steps=n_steps,
     )
     rbpf_oracle = RbpfSlam(
         n_particles=num_particles,
@@ -477,6 +478,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
         measurement_mode="oracle",
         oracle_fn=oracle_fn_multi,
         seed=rbpf_seed,
+        preallocate_steps=n_steps,
     )
 
     init_state = jnp.array([coords_true[0, 0], coords_true[0, 1], headings_true[0]])
@@ -563,15 +565,26 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
         rbpf_online.update(measurement=jnp.array(obs_val), t_now=t_curr)
         rbpf_online.resample()
 
-        _, consensus_pose = rbpf_online.get_best_estimate()
+        # estimate() only reads self.poses/headings/log_weights (fixed shape
+        # every step), unlike get_best_estimate() which reads the full growing
+        # trajectory buffer. Using it here for the per-step consensus pose (the
+        # only thing needed until a checkpoint/end) avoids recompiling a
+        # trajectory-shaped reduction on every single step.
+        consensus_state, _ = rbpf_online.estimate()
+        consensus_pose = consensus_state[:2]
         data_pts_buf.append(
             [t_curr, float(consensus_pose[0]), float(consensus_pose[1])]
         )
         obs_vals_buf.append(obs_val)
 
         if step_idx % 1 == 0:
-            buf_pts = jnp.array(data_pts_buf)
-            buf_vals = jnp.array(obs_vals_buf)
+            # These buffers grow by one row every step, so their shape is never
+            # the same twice. jnp.array()/jnp.asarray() on them would recompile
+            # a shape-specialized transfer op every call; pinn_map.fit() does
+            # the growing-buffer bookkeeping in NumPy internally and only moves
+            # small, fixed-size batches to JAX, so pass plain NumPy arrays here.
+            buf_pts = np.asarray(data_pts_buf, dtype=np.float64)
+            buf_vals = np.asarray(obs_vals_buf, dtype=np.float64)
             pinn_params, _, loss_val = pinn_map.fit(buf_pts, buf_vals, key=k_colloc)
 
         v_est = np.array(pinn_params.v_flow)
@@ -581,8 +594,10 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
             v_y=f"{v_est[1]:.2f}",
         )
 
-        curr_rbpf_traj, curr_rbpf_pos = rbpf_online.get_best_estimate()
-        curr_oracle_traj, curr_oracle_pos = rbpf_oracle.get_best_estimate()
+        rbpf_state, _ = rbpf_online.estimate()
+        oracle_state, _ = rbpf_oracle.estimate()
+        curr_rbpf_pos = rbpf_state[:2]
+        curr_oracle_pos = oracle_state[:2]
 
         viz.update(
             step=step_idx + 1,
@@ -597,6 +612,11 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901
 
         step_num = step_idx + 1
         if step_num in step_to_pct:
+            # Full historical trajectory is only needed at checkpoints/the end,
+            # so the (comparatively expensive) get_best_estimate() call is
+            # confined to these rare steps instead of running every iteration.
+            curr_rbpf_traj, _ = rbpf_online.get_best_estimate()
+            curr_oracle_traj, _ = rbpf_oracle.get_best_estimate()
             stage_params[step_num] = pinn_params
             stage_trajs_true[step_num] = np.array(coords_true[: step_num + 1])
             stage_trajs_dr[step_num] = np.array(coords_dr[: step_num + 1])

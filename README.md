@@ -24,7 +24,9 @@ PDE-SLAM/
 │   │   └── water_features.py# Synthetic Gaussian plume feature generators
 │   ├── pinn.py              # Physics-Informed Neural Network (PINN) mapping & PDE loss
 │   ├── slam/                # Online State Estimation
-│   │   └── rbpf.py          # Multi-field Rao-Blackwellized Particle Filter (RBPF) SLAM
+│   │   ├── rbpf.py          # Multi-field Rao-Blackwellized Particle Filter (RBPF) SLAM
+│   │   ├── graph_slam.py    # Pose-graph SLAM: odometry + loop-closure edges, Gauss-Newton optimization
+│   │   └── graph_field_map.py # Per-field PINN maps tied to GraphSlam nodes (no RBPF)
 │   ├── io/                  # Data Ingestion & Serialization
 │   │   ├── experiment.py    # SlamExperimentData serialization (.pkl)
 │   │   ├── simulation.py    # Multi-field NPZ hydrodynamic simulation dataset loader
@@ -35,7 +37,10 @@ PDE-SLAM/
 ├── examples/                # Core SLAM application entrypoints
 │   ├── rbpf_slam.py         # Flagship multi-field RBPF-SLAM on simulation datasets
 │   ├── rbpf_slam_survey.py  # Field survey CSV trajectory playback RBPF-SLAM
-│   └── rbpf_slam_toy.py     # Fast analytical toy plume SLAM sanity check
+│   ├── rbpf_slam_toy.py     # Fast analytical toy plume SLAM sanity check
+│   ├── graph_slam_survey.py # Pose-graph SLAM with proximity-based loop closure (no RBPF)
+│   ├── graph_slam_pinn_survey.py # Pose-graph SLAM corrected by per-field PINN measurement factors (no RBPF)
+│   └── graph_slam_out_and_back_survey.py # Synthetic out-and-back path (pruned real return leg, mirrored zigzag retrace) for testing loop closure
 ├── test_scripts/            # Diagnostic, visualization & testing scripts
 │   ├── plot_saved_experiment.py     # Publication-grade batch figure visualizer
 │   ├── plot_simulation_dataset.py   # Raw simulation dataset inspector
@@ -69,6 +74,8 @@ PDE-SLAM/
 
 ### 5. State Estimation (`pde_slam/slam/`)
 * **`RbpfSlam`** (`slam/rbpf.py`): Rao-Blackwellized Particle Filter maintaining joint posterior distributions over vehicle trajectory particles and linear observation parameters via Kalman updates with map uncertainty inflation and adaptive systematic resampling.
+* **`GraphSlam`** (`slam/graph_slam.py`): Pose-graph SLAM (pure NumPy, no RBPF) — tracks pose nodes with odometry edges, detects/adds proximity-based loop-closure edges, supports unary `PositionFactor`s (e.g. a field-measurement correction pulling one node's `(x, y)` toward a target), and jointly resolves all of this via Gauss-Newton optimization (`optimize()`), with the first node anchored to fix SE(2) gauge freedom.
+* **`GraphFieldMapper`** (`slam/graph_field_map.py`): One independent single-output `PinnFieldMap` per scalar field, tied to a `GraphSlam` graph by node *index* rather than a baked-in coordinate — so a loop closure that corrects past node positions is automatically reflected the next time each field's map is refit, with no separate relabeling step. Also computes a `PositionFactor` per node via autodiff (predicted value + spatial gradient of each field's PINN), weighted by that field's own training loss so an undertrained field contributes a soft correction that only sharpens as it trains further.
 
 ### 6. Data Ingestion & Serialization (`pde_slam/io/`)
 * **`load_survey_csv`** (`survey.py`): Ingests field survey CSVs, cleans GPS glitches/dropouts `(0.0, 0.0)`, deduplicates timestamps, and interpolates paths into kinematically compliant differential-drive trajectories capped to a specified duration (e.g. $500\text{ s}$).
@@ -124,7 +131,66 @@ python examples/rbpf_slam_survey.py \
 
 ---
 
-### 2. Flagship Multi-Field Simulation SLAM (`examples/rbpf_slam.py`)
+### 2. Pose-Graph SLAM, No RBPF (`examples/graph_slam_*.py`)
+
+Three scripts run the same real CSV survey trajectory through `GraphSlam` +
+`GraphFieldMapper` instead of the particle filter — no RBPF anywhere. All
+support `--csv-file` to point at a different survey CSV and `--t-max` to cap
+duration.
+
+**`graph_slam_survey.py`** — proximity-based loop closure: detects when the
+current node's position comes within `--loop-closure-radius` of an
+old-enough past node and adds a loop-closure edge asserting they coincide.
+On this project's real (densely self-crossing zigzag) survey data this is
+unreliable — many false-positive matches — so treat it as a structural
+example rather than a working localization improvement out of the box.
+
+```bash
+python examples/graph_slam_survey.py --config configs/biscayne_survey_rbpf.yaml --no-show
+```
+
+**`graph_slam_pinn_survey.py`** — field-measurement correction: each of the
+four scalar fields gets its own PINN (`GraphFieldMapper`), queried via
+autodiff at a node's current position to get a predicted value and its
+spatial gradient; the prediction-vs-observation mismatch becomes a unary
+position factor folded into the same Gauss-Newton optimization as the
+odometry edges. On the real survey data this gives a genuine (if modest)
+improvement over dead reckoning.
+
+```bash
+python examples/graph_slam_pinn_survey.py --config configs/biscayne_survey_rbpf.yaml --no-show
+```
+
+**`graph_slam_out_and_back_survey.py`** — a controlled test case: the real
+CSV's outbound zigzag leg is kept, whatever the boat's actual recorded
+return leg was (real data ends with a straight beeline back to the start) is
+pruned and replaced by an exact mirror of the outbound leg, so the path
+returns to its start by retracing the same zigzag pattern. Since the return
+leg revisits the exact same physical points, its field measurements are the
+outbound leg's own recorded values played back in reverse order — not
+freshly resampled. Also supports `--known-loop-closures` (on by default),
+which — since this path's revisit correspondence is known exactly by
+construction, unlike a real deployment's detected ones — adds an exact
+loop-closure edge between each return-leg node and its outbound mirror
+(heading offset by π, since the robot faces the opposite direction retracing
+the track). By default it also saves the constructed path as a CSV
+(`--save-csv`, in `load_survey_csv`'s schema) so it can be replayed by
+`rbpf_slam_survey.py` or either of the other two scripts above.
+
+```bash
+python examples/graph_slam_out_and_back_survey.py --config configs/biscayne_survey_rbpf.yaml --no-show
+
+# Replay the generated out-and-back CSV through RBPF-SLAM (t_max must cover
+# the whole round trip, not just the config's default 500s outbound cap)
+python examples/rbpf_slam_survey.py \
+    --config configs/biscayne_survey_rbpf.yaml \
+    --csv-file data/csv/20260901deployment2_out_and_back.csv \
+    --t-max 662 --no-show
+```
+
+---
+
+### 3. Flagship Multi-Field Simulation SLAM (`examples/rbpf_slam.py`)
 Runs RBPF-SLAM with online PINN mapping on hydrodynamic simulation datasets (e.g. Biscayne Bay or Miami Canal) with user-selected or automated waypoints and Initial Condition (IC) measurement points.
 
 ```bash
@@ -143,7 +209,7 @@ python examples/rbpf_slam.py \
 
 ---
 
-### 3. Fast Analytical Toy SLAM (`examples/rbpf_slam_toy.py`)
+### 4. Fast Analytical Toy SLAM (`examples/rbpf_slam_toy.py`)
 Instantaneous ($< 1\text{ s}$) regression sanity check running RBPF-SLAM on an exact analytical advection-diffusion Gaussian plume without requiring external dataset files.
 
 ```bash

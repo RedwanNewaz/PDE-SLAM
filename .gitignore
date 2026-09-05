@@ -17,3 +17,6 @@ htmlcov/
 *.log
 !output/results/
 scripts/
+.vscode
+.claude
+.agents

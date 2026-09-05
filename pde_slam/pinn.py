@@ -31,6 +31,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from jax import Array
 
@@ -422,24 +423,32 @@ def sample_collocation_points(
     n_colloc = config.num_colloc if num_colloc is None else num_colloc
     m_margin = config.margin if margin is None else margin
 
-    if trajectory_points.shape[1] == 3:
-        x_coords = trajectory_points[:, 1]
-        y_coords = trajectory_points[:, 2]
+    # NOTE: the observation buffer grows by one row every SLAM step, so its
+    # shape is never the same twice. Computing the bounding box with jnp
+    # reductions on it would force a fresh XLA (re)compile every single call
+    # (a new abstract shape each time is a guaranteed cache miss). Doing this
+    # reduction in NumPy instead keeps it off the JAX tracer entirely and
+    # yields plain Python floats, which are just runtime scalars to
+    # jax.random.uniform below (not shape parameters), so no recompile.
+    traj_np = np.asarray(trajectory_points)
+    if traj_np.shape[1] == 3:
+        x_coords = traj_np[:, 1]
+        y_coords = traj_np[:, 2]
     else:
-        x_coords = trajectory_points[:, 0]
-        y_coords = trajectory_points[:, 1]
+        x_coords = traj_np[:, 0]
+        y_coords = traj_np[:, 1]
 
-    x_min_box = jnp.clip(
-        jnp.min(x_coords) - m_margin, config.x_bounds[0], config.x_bounds[1]
+    x_min_box = float(
+        np.clip(x_coords.min() - m_margin, config.x_bounds[0], config.x_bounds[1])
     )
-    x_max_box = jnp.clip(
-        jnp.max(x_coords) + m_margin, config.x_bounds[0], config.x_bounds[1]
+    x_max_box = float(
+        np.clip(x_coords.max() + m_margin, config.x_bounds[0], config.x_bounds[1])
     )
-    y_min_box = jnp.clip(
-        jnp.min(y_coords) - m_margin, config.y_bounds[0], config.y_bounds[1]
+    y_min_box = float(
+        np.clip(y_coords.min() - m_margin, config.y_bounds[0], config.y_bounds[1])
     )
-    y_max_box = jnp.clip(
-        jnp.max(y_coords) + m_margin, config.y_bounds[0], config.y_bounds[1]
+    y_max_box = float(
+        np.clip(y_coords.max() + m_margin, config.y_bounds[0], config.y_bounds[1])
     )
 
     k1, k2, k3 = jax.random.split(key, 3)
@@ -755,7 +764,10 @@ class PinnFieldMap:
             If True, randomly shuffles buf_pts and buf_vals prior to training.
         batch_size : int or None, default=None
             Batch size for observation sampling. If None, defaults to config.batch_size.
-            Passing a static batch size prevents JAX JIT recompilation.
+            Passing a static batch size prevents JAX JIT recompilation. Batches are
+            sampled with replacement (uniformly over the whole buffer) regardless
+            of buffer size, so the sampling op's compiled shape never depends on
+            how many observations have been collected so far.
 
         Returns
         -------
@@ -773,18 +785,34 @@ class PinnFieldMap:
             )
             raise ValueError(msg)
 
-        t_curr = float(jnp.max(buf_pts[:, 0]))
+        # NOTE: buf_pts/buf_vals grow by one row every SLAM step, so their shape
+        # is never the same twice. Moving them onto the JAX tracer at all (even
+        # just for a reduction, or a plain device transfer via jnp.array/
+        # jnp.asarray) triggers a fresh XLA compile per call, since the
+        # transfer/conversion program XLA builds is shape-specialized. Doing
+        # the max/argmax/batch-selection in NumPy instead keeps the growing
+        # buffer off the tracer entirely; only the resulting FIXED-size
+        # (bs, ...) batch and (n_colloc, 3) collocation points are ever handed
+        # to JAX, so those compile once and are reused every step regardless of
+        # how large the buffer has grown.
+        buf_pts_np = np.asarray(buf_pts, dtype=np.float64)
+        buf_vals_np = np.asarray(buf_vals, dtype=np.float64)
+
+        t_curr = float(buf_pts_np[:, 0].max())
         k_colloc, k_batch = jax.random.split(key)
 
         bs = int(self.config.batch_size if batch_size is None else batch_size)
-        n_obs = buf_pts.shape[0]
+        n_obs = buf_pts_np.shape[0]
 
-        # Sample a fixed static batch_size of observations to prevent JAX recompilation
-        idx = jax.random.choice(k_batch, n_obs, shape=(bs,), replace=(n_obs < bs))
-        batch_pts = buf_pts[idx]
-        batch_vals = buf_vals[idx]
+        # Sample a fixed static batch_size of observations to prevent JAX
+        # recompilation. Index generation stays on the JAX PRNG key (for
+        # reproducibility) but the indices are applied to the NumPy buffer, so
+        # the growing population size (n_obs) never reaches the tracer.
+        idx = np.asarray(jax.random.randint(k_batch, shape=(bs,), minval=0, maxval=n_obs))
+        batch_pts = jnp.asarray(buf_pts_np[idx])
+        batch_vals = jnp.asarray(buf_vals_np[idx])
 
-        colloc_pts = self.sample_collocation_points(buf_pts, t_curr, key=k_colloc)
+        colloc_pts = self.sample_collocation_points(buf_pts_np, t_curr, key=k_colloc)
 
         curr_params = self.params
         curr_opt_state = self.opt_state
