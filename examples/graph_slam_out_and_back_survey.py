@@ -70,7 +70,7 @@ def wrap_angle(theta: np.ndarray) -> np.ndarray:
 
 
 def build_out_and_back_path(
-    coords: np.ndarray, turnaround_idx: int | None = None
+    coords: np.ndarray, turnaround_idx: int | None = None, turn_dwell: int = 8
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Prunes whatever return leg a recorded path took and replaces it with
     an exact mirror of its outbound leg.
@@ -107,10 +107,40 @@ def build_out_and_back_path(
 
     outbound = coords[: turnaround_idx + 1]
     return_leg = outbound[-2::-1]  # reverse, excluding the turnaround point (already included once)
-    new_coords = np.concatenate([outbound, return_leg], axis=0)
+
+    # Dwell at the apex before reversing. The consumer of this path
+    # (load_survey_csv -> interpolate_kinematic_trajectory) refits a
+    # kinematically feasible differential-drive path through these points, and
+    # an instantaneous 180-degree reversal is not feasible: the smoother cuts
+    # the corner, the path loses length, and the vehicle ends up short of its
+    # start. Holding position for a few steps gives it time to turn in place.
+    if turn_dwell > 0:
+        apex = np.repeat(outbound[-1][None, :], turn_dwell, axis=0)
+        new_coords = np.concatenate([outbound, apex, return_leg], axis=0)
+    else:
+        new_coords = np.concatenate([outbound, return_leg], axis=0)
 
     deltas = np.diff(new_coords, axis=0)
     motion_headings = np.arctan2(deltas[:, 1], deltas[:, 0])
+    # Stationary dwell steps have a zero delta, whose atan2 is a meaningless 0;
+    # carry the previous heading forward through them instead.
+    # Stationary dwell steps have a zero delta, whose atan2 is a meaningless 0.
+    # Ramp the heading across them instead of carrying it forward: the loader
+    # feeds this Heading column to the kinematic refit, and an instantaneous
+    # 180-degree flip there is not realizable, so the refit cuts the corner and
+    # the vehicle lands short of its start. A gradual turn-in-place is.
+    moving = np.linalg.norm(deltas, axis=1) > 1e-9
+    idx = np.arange(len(motion_headings))
+    stationary = idx[~moving]
+    if stationary.size:
+        before = stationary[0] - 1
+        after = stationary[-1] + 1
+        h_start = motion_headings[before] if before >= 0 else motion_headings[after]
+        h_end = motion_headings[after] if after < len(motion_headings) else h_start
+        # Shortest-arc interpolation across the reversal.
+        delta_h = (h_end - h_start + np.pi) % (2.0 * np.pi) - np.pi
+        for k, i in enumerate(stationary, start=1):
+            motion_headings[i] = h_start + delta_h * k / (stationary.size + 1)
     new_headings = np.concatenate([motion_headings, motion_headings[-1:]])
 
     return new_coords, new_headings, turnaround_idx
@@ -295,6 +325,15 @@ def main(argv: list[str] | None = None) -> None:
     outbound_t_max_cap = min(outbound_t_max_cap, float(sim_data.sample_times[-1]))
     polygon_enu = sim_data.polygon_enu
 
+    # Same normalization the single-pass script uses: raw units make a poor
+    # PINN target (salinity ~30.04 with a spatial std of only ~0.10), so the
+    # network spends its capacity on the DC offset rather than on the spatial
+    # structure that actually carries position information.
+    field_norm_std = {f: float(sim_data.field_stds[f]) for f in sim_data.field_names}
+    obs_noise_norm = {
+        f: max(OBS_NOISE_STD / field_norm_std[f], 1e-6) for f in sim_data.field_names
+    }
+
     print(f"\n  Loading raw survey trajectory from: {csv_path}")
     survey_traj = load_survey_csv(
         csv_path=csv_path, t_max=outbound_t_max_cap, dt=dt, enu_frame=sim_data.enu_frame
@@ -363,9 +402,9 @@ def main(argv: list[str] | None = None) -> None:
         pos = coords_true[step + 1]
         vals = {
             f: sample_simulation_field(
-                sim_data, f, t_curr, float(pos[0]), float(pos[1]), normalized=False
+                sim_data, f, t_curr, float(pos[0]), float(pos[1]), normalized=True
             )
-            + float(np.random.normal(0.0, OBS_NOISE_STD))
+            + float(np.random.normal(0.0, obs_noise_norm[f]))
             for f in sim_data.field_names
         }
         obs_vals_outbound.append(vals)
@@ -423,7 +462,12 @@ def main(argv: list[str] | None = None) -> None:
         hidden_dim=cfg.pinn.hidden_dim,
         num_layers=cfg.pinn.num_layers,
         learning_rate=cfg.pinn.learning_rate,
-        num_steps=cfg.pinn.num_steps,
+        num_steps=(
+            cfg.graph_slam.pinn_steps
+            if cfg.graph_slam.pinn_steps is not None
+            else cfg.pinn.num_steps
+        ),
+        batch_size=cfg.graph_slam.pinn_batch,
         num_colloc=cfg.pinn.num_colloc,
         margin=cfg.pinn.margin,
         w_pde=cfg.pinn.w_pde,
@@ -439,9 +483,9 @@ def main(argv: list[str] | None = None) -> None:
     for ic_pos in ic_points_enu:
         ic_vals = {
             f: sample_simulation_field(
-                sim_data, f, 0.0, float(ic_pos[0]), float(ic_pos[1]), normalized=False
+                sim_data, f, 0.0, float(ic_pos[0]), float(ic_pos[1]), normalized=True
             )
-            + float(np.random.normal(0.0, OBS_NOISE_STD))
+            + float(np.random.normal(0.0, obs_noise_norm[f]))
             for f in sim_data.field_names
         }
         field_mapper.add_fixed_observation(np.asarray(ic_pos), 0.0, ic_vals)
@@ -544,20 +588,26 @@ def main(argv: list[str] | None = None) -> None:
             field_mapper.add_observation(node_idx, t_curr, step_obs)
 
         step_num = step_idx + 1
-        if step_num % args.fit_interval == 0 or step_num == n_steps:
-            prng_key, k_fit = jax.random.split(prng_key)
-            field_losses = field_mapper.fit(graph_slam, key=k_fit)
 
+        # Correct BEFORE refitting so the map used has not yet seen this node's
+        # own reading (leave-one-out). Correcting after the fit lets the map
+        # memorize the observation at the drifted position, collapsing the
+        # residual to ~0 -- the correction then reports "already correct" no
+        # matter how wrong the pose is.
         # No-op (returns False) for the one step with no observation (see the
-        # comment above obs_vals_return) -- apply_field_correction already
-        # handles a node with nothing buffered for it.
+        # comment above obs_vals_return).
         field_mapper.apply_field_correction(
             node_idx,
             graph_slam,
-            measurement_noise_std=OBS_NOISE_STD,
+            measurement_noise_std=obs_noise_norm,
             field_losses=field_losses,
             max_correction=args.max_correction,
+            map_error_frac=cfg.graph_slam.map_error_frac,
         )
+
+        if step_num % args.fit_interval == 0 or step_num == n_steps:
+            prng_key, k_fit = jax.random.split(prng_key)
+            field_losses = field_mapper.fit(graph_slam, key=k_fit)
 
         if args.known_loop_closures and node_idx > turnaround_idx:
             # This path was engineered so the return leg exactly revisits the
@@ -568,14 +618,18 @@ def main(argv: list[str] | None = None) -> None:
             # tight loop-closure edge instead of relying only on the softer,
             # field-derived position factor.
             #
-            # The two nodes coincide in POSITION but not heading: the robot is
-            # retracing the same track in the opposite direction, so the true
-            # relative heading is ~pi, not 0 -- add_loop_closure_edge's default
-            # (identity, same heading) would otherwise force a wrong 180-degree
-            # heading constraint and badly corrupt the fit.
+            # Constrain POSITION ONLY, leaving headings free. A full SE(2)
+            # edge additionally pins the relative heading, and here that
+            # heading is only approximately pi: the mirrored path's headings
+            # are recomputed from consecutive reversed positions, so they are
+            # not an exact 180-degree offset of the outbound ones. Asserting an
+            # exact pi offset injects error the optimizer then spreads through
+            # the whole graph, distorting interior nodes -- which is why the
+            # earlier SE(2) version improved return-to-start closure while
+            # making overall trajectory RMSE worse.
             mirror_idx = 2 * turnaround_idx - node_idx
-            graph_slam.add_loop_closure_edge(
-                mirror_idx, node_idx, measurement=np.array([0.0, 0.0, np.pi])
+            graph_slam.add_position_loop_closure(
+                mirror_idx, node_idx, information=cfg.graph_slam.loop_closure.information
             )
 
         did_optimize = False

@@ -128,6 +128,61 @@ class SurveyConfig:
 
 
 @dataclass
+class GraphSlamLoopClosureConfig:
+    """Measurement-signature loop-closure association parameters.
+
+    Nodes are associated by comparing the scalar readings stored on them, not
+    by proximity in the (drifting) pose estimate -- drift can make unrelated
+    nodes look co-located, which produces false matches that corrupt the graph.
+    """
+
+    enabled: bool = True
+    # Max distance between two nodes' normalized signatures to call them the
+    # same place. Combined field gradients are ~0.2 normalized units/m, so
+    # 0.06 corresponds to roughly 0.3 m of position discrimination.
+    tol: float = 0.06
+    min_gap: int = 50
+    max_radius: float = 15.0
+    information: float = 4.0
+    # Position-only constraints (headings left free). Matching readings say
+    # "same place"; they say nothing about which way the vehicle was pointing,
+    # so constraining relative heading is unsupported and distorts the graph.
+    position_only: bool = True
+
+
+@dataclass
+class GraphSlamConfig:
+    """Pose-graph SLAM + per-field PINN mapping parameters."""
+
+    optimize_interval: int = 5
+    optimize_iters: int = 5
+    fit_interval: int = 1
+    # Trust-region cap [m] on a single field-measurement position correction.
+    max_correction: float = 2.0
+    # Trailing nodes re-linearized against the current maps each optimization.
+    refresh_window: int = 60
+    # Assumed map predictive error as a fraction of each field's observed
+    # min-max range. Deliberately NOT the training loss: that is in-sample and
+    # collapses toward zero, which makes corrections overconfident enough to
+    # overpower odometry and drag the graph to wherever a drift-fitted map
+    # points.
+    map_error_frac: float = 0.05
+    # Feed observations to the PINNs zero-mean/unit-variance normalized. Raw
+    # units are a poor training target (e.g. salinity ~30.04 with a spatial std
+    # of only ~0.10), so the network spends capacity on the DC offset.
+    normalize_fields: bool = True
+    # Correct a node before refitting, so the map used has not yet seen that
+    # node's own reading (leave-one-out). Correcting after the fit lets the map
+    # memorize the observation at the drifted position, collapsing the residual.
+    correct_before_fit: bool = True
+    pinn_steps: int | None = None
+    pinn_batch: int = 256
+    loop_closure: GraphSlamLoopClosureConfig = field(
+        default_factory=GraphSlamLoopClosureConfig
+    )
+
+
+@dataclass
 class RbpfExperimentConfig:
     """Comprehensive experiment configuration for RBPF simulation runs."""
 
@@ -138,6 +193,7 @@ class RbpfExperimentConfig:
     pinn: PinnMapConfig = field(default_factory=PinnMapConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     survey: SurveyConfig = field(default_factory=SurveyConfig)
+    graph_slam: GraphSlamConfig = field(default_factory=GraphSlamConfig)
 
 
 def load_rbpf_experiment_config(yaml_path: str | Path) -> RbpfExperimentConfig:
@@ -256,6 +312,31 @@ def load_rbpf_experiment_config(yaml_path: str | Path) -> RbpfExperimentConfig:
         use_csv_measurements=bool(survey_raw.get("use_csv_measurements", False)),
     )
 
+    gs_raw = raw.get("graph_slam", {})
+    lc_raw = gs_raw.get("loop_closure", {})
+    graph_slam_cfg = GraphSlamConfig(
+        optimize_interval=int(gs_raw.get("optimize_interval", 5)),
+        optimize_iters=int(gs_raw.get("optimize_iters", 5)),
+        fit_interval=int(gs_raw.get("fit_interval", 1)),
+        max_correction=float(gs_raw.get("max_correction", 2.0)),
+        refresh_window=int(gs_raw.get("refresh_window", 60)),
+        map_error_frac=float(gs_raw.get("map_error_frac", 0.05)),
+        normalize_fields=bool(gs_raw.get("normalize_fields", True)),
+        correct_before_fit=bool(gs_raw.get("correct_before_fit", True)),
+        pinn_steps=(
+            int(gs_raw["pinn_steps"]) if gs_raw.get("pinn_steps") is not None else None
+        ),
+        pinn_batch=int(gs_raw.get("pinn_batch", 256)),
+        loop_closure=GraphSlamLoopClosureConfig(
+            enabled=bool(lc_raw.get("enabled", True)),
+            tol=float(lc_raw.get("tol", 0.06)),
+            min_gap=int(lc_raw.get("min_gap", 50)),
+            max_radius=float(lc_raw.get("max_radius", 15.0)),
+            information=float(lc_raw.get("information", 4.0)),
+            position_only=bool(lc_raw.get("position_only", True)),
+        ),
+    )
+
     return RbpfExperimentConfig(
         simulation=simulation_cfg,
         ic_anchors=ic_cfg,
@@ -264,6 +345,7 @@ def load_rbpf_experiment_config(yaml_path: str | Path) -> RbpfExperimentConfig:
         pinn=pinn_cfg,
         output=out_cfg,
         survey=survey_cfg,
+        graph_slam=graph_slam_cfg,
     )
 
 

@@ -55,6 +55,13 @@ from pde_slam.kinematics import DiffDriveKinematics
 from pde_slam.pinn import PinnConfig
 from pde_slam.slam import GraphFieldMapper, GraphSlam
 
+_FIELD_TO_CSV_COLUMN = {
+    "salinity": "Salinity (PPT)",
+    "temperature": "Temperature (C)",
+    "odo": "ODO (mg/L)",
+    "chlorophyll": "Chlorophyll (ug/L)",
+}
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments.
@@ -95,27 +102,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fit-interval",
         type=int,
-        default=1,
+        default=None,
         help="Refit every field's PINN every N steps.",
     )
     parser.add_argument(
         "--optimize-interval",
         type=int,
-        default=5,
+        default=None,
         help="Run graph optimization every N steps (dense Gauss-Newton solve "
         "cost grows with graph size, so this need not be every step).",
     )
     parser.add_argument(
         "--max-correction",
         type=float,
-        default=2.0,
+        default=None,
         help="Trust-region cap [m] on a single field-measurement position "
         "correction step.",
     )
     parser.add_argument(
         "--refresh-window",
         type=int,
-        default=60,
+        default=None,
         help="Re-linearize this many trailing nodes' field corrections against the "
         "current (better-trained) maps each optimization cycle. 0 disables.",
     )
@@ -129,14 +136,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pinn-batch",
         type=int,
-        default=256,
+        default=None,
         help="Observations sampled per PINN gradient step. The default buffer grows "
         "to ~600 points, so too small a batch leaves the map noisily fit.",
     )
     parser.add_argument(
         "--map-error-frac",
         type=float,
-        default=0.05,
+        default=None,
         help="Assumed map predictive error as a fraction of each field's observed "
         "min-max range (stored per node). Sets how much a field correction is "
         "trusted; training loss is NOT used for this because it is in-sample and "
@@ -145,7 +152,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--measurement-loop-tol",
         type=float,
-        default=0.06,
+        default=None,
         help="Max distance between two nodes' normalized scalar signatures to call "
         "them the same place. 0 disables measurement-based loop closure. Field "
         "gradients are ~0.2 normalized units/m combined, so 0.06 ~ 0.3 m of "
@@ -154,21 +161,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--measurement-loop-gap",
         type=int,
-        default=50,
+        default=None,
         help="Minimum node-index separation before a measurement match counts.",
     )
     parser.add_argument(
         "--measurement-loop-radius",
         type=float,
-        default=15.0,
+        default=None,
         help="Reject a signature match whose current position estimate is farther "
         "than this (guards against matching a distant look-alike).",
     )
     parser.add_argument(
         "--measurement-loop-info",
         type=float,
-        default=4.0,
+        default=None,
         help="Information weight for a measurement loop closure (4.0 ~ 0.5 m std).",
+    )
+    parser.add_argument(
+        "--use-csv-measurements",
+        action="store_true",
+        help="Read the field readings from the CSV's sensor columns instead of "
+        "resampling the simulation. Required for CSVs whose measurements encode "
+        "something the simulation does not reproduce -- e.g. the out-and-back "
+        "CSV, whose return leg replays the outbound readings in reverse. "
+        "Resampling the time-evolving simulation instead gives a revisited "
+        "place a completely different signature, so revisits become "
+        "undetectable and loop closure never fires.",
+    )
+    parser.add_argument(
+        "--no-loop-closure",
+        action="store_true",
+        help="Disable measurement-signature loop closure entirely (ablation).",
     )
     parser.add_argument(
         "--seed", type=int, default=43, help="PRNG seed for process/measurement noise."
@@ -197,6 +220,30 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = load_rbpf_experiment_config(args.config)
 
+    # CLI flags override the config's graph_slam section; anything left unset
+    # falls back to the config value.
+    gs = cfg.graph_slam
+    def _pick(cli, cfg_val):
+        return cfg_val if cli is None else cli
+
+    args.fit_interval = _pick(args.fit_interval, gs.fit_interval)
+    args.optimize_interval = _pick(args.optimize_interval, gs.optimize_interval)
+    args.max_correction = _pick(args.max_correction, gs.max_correction)
+    args.refresh_window = _pick(args.refresh_window, gs.refresh_window)
+    args.pinn_batch = _pick(args.pinn_batch, gs.pinn_batch)
+    args.map_error_frac = _pick(args.map_error_frac, gs.map_error_frac)
+    args.pinn_steps = _pick(args.pinn_steps, gs.pinn_steps)
+    args.measurement_loop_tol = _pick(args.measurement_loop_tol, gs.loop_closure.tol)
+    args.measurement_loop_gap = _pick(args.measurement_loop_gap, gs.loop_closure.min_gap)
+    args.measurement_loop_radius = _pick(
+        args.measurement_loop_radius, gs.loop_closure.max_radius
+    )
+    args.measurement_loop_info = _pick(
+        args.measurement_loop_info, gs.loop_closure.information
+    )
+    if args.no_loop_closure or not gs.loop_closure.enabled:
+        args.measurement_loop_tol = 0.0
+
     sim_dir = Path(args.sim_dir if args.sim_dir is not None else cfg.simulation.sim_dir)
     csv_path = Path(args.csv_file if args.csv_file is not None else cfg.survey.csv_path)
     t_max_cap = float(args.t_max if args.t_max is not None else cfg.survey.t_max)
@@ -220,7 +267,19 @@ def main(argv: list[str] | None = None) -> None:
     if not sim_dir.exists():
         raise FileNotFoundError(f"Simulation directory '{sim_dir}' does not exist.")
     sim_data = load_simulation_dataset(sim_dir, requested_fields=cfg.simulation.fields or None)
-    t_max_cap = min(t_max_cap, float(sim_data.sample_times[-1]))
+    # Only clamp the trajectory to the simulation's duration when we actually
+    # sample the simulation per step. With --use-csv-measurements the readings
+    # come from the CSV, and the simulation is needed only for the domain
+    # bounds and IC anchors -- clamping there silently truncates the run (e.g.
+    # cutting a 662 s out-and-back at 499 s, so the return leg never completes
+    # and its revisits never happen).
+    sim_t_max = float(sim_data.sample_times[-1])
+    if not args.use_csv_measurements and t_max_cap > sim_t_max:
+        print(
+            f"  NOTE: capping t_max {t_max_cap:.0f}s -> {sim_t_max:.0f}s "
+            "(simulation duration; pass --use-csv-measurements to run longer)"
+        )
+        t_max_cap = sim_t_max
     polygon_enu = sim_data.polygon_enu
     print(f"  Loaded {len(sim_data.field_names)} simulation fields: {sim_data.field_names}")
 
@@ -249,8 +308,21 @@ def main(argv: list[str] | None = None) -> None:
     # ------------------------------------------------------------------
     print(f"\n[2/4] Loading survey trajectory from: {csv_path}")
     survey_traj = load_survey_csv(
-        csv_path=csv_path, t_max=t_max_cap, dt=dt, enu_frame=sim_data.enu_frame
+        csv_path=csv_path,
+        t_max=t_max_cap,
+        dt=dt,
+        enu_frame=sim_data.enu_frame,
+        field_mappings={f: _FIELD_TO_CSV_COLUMN.get(f, f) for f in sim_data.field_names},
     )
+    if args.use_csv_measurements:
+        missing = [f for f in sim_data.field_names if f not in survey_traj.measurements]
+        if missing:
+            raise ValueError(
+                f"--use-csv-measurements: CSV {csv_path} has no column for {missing}."
+            )
+        print(f"  Measurement source: CSV sensor columns ({len(sim_data.field_names)} fields)")
+    else:
+        print("  Measurement source: simulation resampling")
     coords_true = np.array(survey_traj.coords_enu)
     headings_true = np.array(survey_traj.headings)
     velocities_nominal = np.array(survey_traj.velocities[:-1])
@@ -410,13 +482,26 @@ def main(argv: list[str] | None = None) -> None:
         ctrl = np.array([v_act[step_idx], w_act[step_idx]])
         node_idx = graph_slam.predict(control=ctrl, dt=dt)
 
-        obs_vals = {
-            f: sample_simulation_field(
-                sim_data, f, t_curr, float(true_pos[0]), float(true_pos[1]), normalized=True
-            )
-            + float(np.random.normal(0.0, obs_noise_norm[f]))
-            for f in sim_data.field_names
-        }
+        if args.use_csv_measurements:
+            # CSV values are raw physical units; normalize with the same
+            # per-field statistics used for the simulation-sampled path so both
+            # sources land in identical units.
+            obs_vals = {
+                f: (
+                    float(survey_traj.measurements[f][step_idx + 1])
+                    - float(sim_data.field_means[f])
+                )
+                / field_norm_std[f]
+                for f in sim_data.field_names
+            }
+        else:
+            obs_vals = {
+                f: sample_simulation_field(
+                    sim_data, f, t_curr, float(true_pos[0]), float(true_pos[1]), normalized=True
+                )
+                + float(np.random.normal(0.0, obs_noise_norm[f]))
+                for f in sim_data.field_names
+            }
         field_mapper.add_observation(node_idx, t_curr, obs_vals)
         # Keep the scalar readings on the graph node itself, so nodes can be
         # associated by what was measured there rather than by where the

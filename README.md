@@ -149,6 +149,29 @@ example rather than a working localization improvement out of the box.
 python examples/graph_slam_survey.py --config configs/biscayne_survey_rbpf.yaml --no-show
 ```
 
+Graph-SLAM parameters live in their own config section (see
+[`configs/graph_slam_survey.yaml`](configs/graph_slam_survey.yaml), parsed into
+`GraphSlamConfig`); every value can still be overridden on the CLI.
+
+```bash
+python examples/graph_slam_pinn_survey.py --config configs/graph_slam_survey.yaml --no-show
+```
+
+Three settings there matter far more than the rest, each fixing a defect that
+made corrections actively harmful:
+
+* `normalize_fields` — raw units are a poor PINN target (salinity ~30.04 with a
+  spatial std of only ~0.10), so the net learns the DC offset instead of the
+  spatial structure that carries position information.
+* `map_error_frac` — how much a field correction is trusted, taken as a
+  fraction of each field's observed min-max range (stored per node). Using the
+  *training* loss instead is a trap: it is in-sample, collapses toward zero,
+  and makes corrections confident enough to overpower odometry (observed: error
+  blowing up to 45 m).
+* `correct_before_fit` — correct a node before refitting, so the map hasn't yet
+  memorized that node's own reading. Otherwise the residual collapses to ~0 and
+  the correction reports "already correct" regardless of the true error.
+
 **`graph_slam_pinn_survey.py`** — field-measurement correction: each of the
 four scalar fields gets its own PINN (`GraphFieldMapper`), queried via
 autodiff at a node's current position to get a predicted value and its
